@@ -851,6 +851,47 @@ Fields not implemented:
 
         return stripe_invoiceitem
 
+    def add_bank_account(self, source, set_default=True):
+        """
+        Adds a bank account to this customer's account.
+
+        :param source: Either a token, like the ones returned by our Stripe.js, or a dictionary containing a
+                       user's bank account details. It is nessecary to validate details by microdeposits.
+        :type source: string, dict
+        :param set_default: Whether or not to set the source as the customer's default source
+        :type set_default: boolean
+
+        """
+
+        stripe_customer = self.api_retrieve()
+        stripe_bank_account = stripe_customer.sources.create(source=source)
+
+        if set_default:
+            stripe_customer.default_source = stripe_bank_account["id"]
+            stripe_customer.save()
+
+        if not stripe_bank_account.get('default_for_currency'):
+            stripe_bank_account['default_for_currency'] = False
+
+        return stripe_bank_account
+
+    def verify_bank_account(self, bank_account_stripe_id, amounts):
+        """
+        Verify a customer's bank account.
+
+        :param bank_account_stripe_id: stripe id, e.g. ba_1C7OIjF0EnuVqVc643uPgV6E
+        :type bank_account_stripe_id: string
+        :param amounts: two positive integers, in cents,
+                        equal to the values of the microdeposits sent to the bank account
+        :type amounts: list
+        :return: the bank account object with a status of verified
+        :rtype: dict
+        """
+        stripe_customer = self.api_retrieve()
+        stripe_bank_account = stripe_customer.sources.retrieve(bank_account_stripe_id)
+
+        return stripe_bank_account.verify(amounts=amounts)
+
     def add_card(self, source, set_default=True):
         """
         Adds a card to this customer's account.
@@ -1172,6 +1213,137 @@ class StripeAccount(StripeObject):
 # ============================================================================ #
 #                               Payment Methods                                #
 # ============================================================================ #
+
+class StripeBankAccount(StripeSource):
+
+    class Meta:
+        abstract = True
+
+    stripe_class = stripe.BankAccount
+
+    account_holder_name = StripeCharField(
+        max_length=5000, null=True,
+        help_text="The name of the person or business that owns the bank account."
+    )
+    account_holder_type = StripeCharField(
+        max_length=10, choices=enums.BankAccountHolderType.choices,
+        help_text="The type of entity that holds the account."
+    )
+    bank_name = StripeCharField(
+        max_length=255,
+        help_text="Name of the bank associated with the routing number (e.g., `WELLS FARGO`)."
+    )
+    country = StripeCharField(
+        max_length=2,
+        help_text="Two-letter ISO code representing the country the bank account is located in."
+    )
+    currency = StripeCharField(max_length=3, help_text="Three-letter ISO currency code")
+    default_for_currency = StripeNullBooleanField(
+        default=None,
+        null=True,
+        help_text="Whether this external account is the default account for its currency."
+    )
+    fingerprint = StripeCharField(
+        max_length=16,
+        help_text=(
+            "Uniquely identifies this particular bank account. "
+            "You can use this attribute to check whether two bank accounts are the same."
+        )
+    )
+    last4 = StripeCharField(max_length=4)
+    routing_number = StripeCharField(max_length=255, help_text="The routing transit number for the bank account.")
+    status = StripeCharField(max_length=19, choices=enums.BankAccountStatus.choices)
+
+    def api_retrieve(self, api_key=None):
+        # OVERRIDING the parent version of this function
+        # Bank accounts must be manipulated through a customer or account.
+        # TODO: When managed accounts are supported, this method needs to check if
+        # either a customer or account is supplied to determine the correct object to use.
+        api_key = api_key or self.default_api_key
+        customer = self.customer.api_retrieve(api_key=api_key)
+
+        # If the customer is deleted, the sources attribute will be absent.
+        # eg. {"id": "cus_XXXXXXXX", "deleted": True}
+        if "sources" not in customer:
+            # We fake a native stripe InvalidRequestError so that it's caught like an invalid ID error.
+            raise InvalidRequestError("No such source: %s" % (self.stripe_id), "id")
+
+        return customer.sources.retrieve(self.stripe_id, expand=self.expand_fields)
+
+    @staticmethod
+    def _get_customer_from_kwargs(**kwargs):
+        if "customer" not in kwargs or not isinstance(kwargs["customer"], StripeCustomer):
+            raise StripeObjectManipulationException("Bank accounts must be manipulated through a Customer. "
+                                                    "Pass a Customer object into this call.")
+
+        customer = kwargs["customer"]
+        del kwargs["customer"]
+
+        return customer, kwargs
+
+    @classmethod
+    def _api_create(cls, api_key=djstripe_settings.STRIPE_SECRET_KEY, **kwargs):
+        # OVERRIDING the parent version of this function
+        # Bank accounts must be manipulated through a customer or account.
+        # TODO: When managed accounts are supported, this method needs to check if either a customer or
+        #       account is supplied to determine the correct object to use.
+
+        customer, clean_kwargs = cls._get_customer_from_kwargs(**kwargs)
+
+        return customer.api_retrieve().sources.create(api_key=api_key, **clean_kwargs)
+
+    @classmethod
+    def api_list(cls, api_key=djstripe_settings.STRIPE_SECRET_KEY, **kwargs):
+        # OVERRIDING the parent version of this function
+        # Bank accounts must be manipulated through a customer or account.
+        # TODO: When managed accounts are supported, this method needs to check if either a customer or
+        #       account is supplied to determine the correct object to use.
+
+        customer, clean_kwargs = cls._get_customer_from_kwargs(**kwargs)
+
+        return customer.api_retrieve(api_key=api_key).sources.list(object="bank_account", **clean_kwargs) \
+            .auto_paging_iter()
+
+    def str_parts(self):
+        return [
+            "bank_name={bank_name}".format(bank_name=self.bank_name),
+            "last4={last4}".format(last4=self.last4),
+            "currency={currency}".format(currency=self.currency),
+            "country={country}".format(country=self.country),
+            "status={status}".format(status=self.status),
+        ] + super(StripeBankAccount, self).str_parts()
+
+    @classmethod
+    def create_token(cls, country, currency, account_holder_name, account_holder_type, routing_number, account_number,
+                     **kwargs):
+        """
+        Creates a single use token that wraps the details of a bank account. This token can be used in
+        place of a bank account dictionary with any API method. These tokens can only be used once: by
+        creating a new charge object, or attaching them to a customer.
+        (Source: https://stripe.com/docs/api/python#create_bank_account_token)
+
+        :param exp_month: The card's expiration month.
+        :type exp_month: Two digit int
+        :param exp_year: The card's expiration year.
+        :type exp_year: Two or Four digit int
+        :param number: The card number
+        :type number: string without any separators (no spaces)
+        :param cvc: Card security code.
+        :type cvc: string
+        """
+
+        bank_account = {
+            "country": country,
+            "currency": currency,
+            "account_holder_name": account_holder_name,
+            "account_holder_type": account_holder_type,
+            "routing_number": routing_number,
+            "account_number": account_number
+        }
+        bank_account.update(kwargs)
+
+        return stripe.Token.create(bank_account=bank_account)
+
 
 class StripeCard(StripeSource):
     """

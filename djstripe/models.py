@@ -37,7 +37,7 @@ from .fields import StripeDateTimeField
 from .managers import SubscriptionManager, ChargeManager, TransferManager
 from .signals import WEBHOOK_SIGNALS, webhook_processing_error
 from .stripe_objects import (
-    StripeAccount, StripeCard, StripeCharge, StripeCoupon, StripeCustomer,
+    StripeAccount, StripeBankAccount, StripeCard, StripeCharge, StripeCoupon, StripeCustomer,
     StripeEvent, StripeInvoice, StripeInvoiceItem, StripePayout, StripePlan,
     StripeSource, StripeSubscription, StripeTransfer
 )
@@ -404,6 +404,35 @@ Use ``Customer.sources`` and ``Customer.subscriptions`` to access them.
         """ Check whether the customer has a valid payment source."""
         return self.default_source is not None
 
+    def add_bank_account(self, source, set_default=True):
+        new_stripe_bank_account = super(Customer, self).add_bank_account(source, set_default)
+        new_bank_account = BankAccount.sync_from_stripe_data(new_stripe_bank_account)
+
+        # Change the default source
+        if set_default:
+            self.default_source = new_bank_account
+            self.save()
+
+        return new_bank_account
+
+    def verify_bank_account(self, bank_account, amounts):
+        """
+        Verify a customer's bank account.
+
+        :param bank_account: BankAccount instance or its stripe ID
+        :type bank_account: BankAccount, string
+        :param amounts: two positive integers, in cents,
+                        equal to the values of the microdeposits sent to the bank account
+        :type amounts: list
+        :return: The BankAccount instance with a status of verified
+        :rtype: BankAccount
+        """
+        bank_account_stripe_id = bank_account.stripe_id if isinstance(bank_account, BankAccount) else bank_account
+        new_stripe_bank_account = super(Customer, self).verify_bank_account(bank_account_stripe_id, amounts)
+        new_bank_account = BankAccount.sync_from_stripe_data(new_stripe_bank_account)
+
+        return new_bank_account
+
     def add_card(self, source, set_default=True):
         new_stripe_card = super(Customer, self).add_card(source, set_default)
         new_card = Card.sync_from_stripe_data(new_stripe_card)
@@ -682,6 +711,50 @@ class Account(StripeAccount):
 # ============================================================================ #
 #                               Payment Methods                                #
 # ============================================================================ #
+
+@class_doc_inherit
+class BankAccount(StripeBankAccount):
+    """
+    Store customer's bank account synced from stripe dashboard.
+
+    The model is named with Customer- prefix to made migration easier to new release of the official djstripe package
+    where the simial model is named as BankAccount
+    This is made because altering model bases does not quite work in django migrations.
+    https://groups.google.com/forum/#!topic/django-developers/Z43FvzPP3HA
+    So it would be easier to name model with another name.
+    """
+    __doc__ = getattr(StripeCard, "__doc__")
+
+    def _attach_objects_hook(self, cls, data):
+        customer = cls._stripe_object_to_customer(target_cls=Customer, data=data)
+        if customer:
+            self.customer = customer
+        else:
+            raise ValidationError("A customer was not attached to this bank account.")
+
+    def get_stripe_dashboard_url(self):
+        return self.customer.get_stripe_dashboard_url()
+
+    def remove(self):
+        """Removes a bank account from this customer's account."""
+
+        try:
+            self._api_delete()
+        except InvalidRequestError as exc:
+            if "No such source:" in str(exc) or "No such customer:" in str(exc):
+                # The exception was thrown because the stripe customer or bank account was already
+                # deleted on the stripe side, ignore the exception
+                pass
+            else:
+                # The exception was raised for another reason, re-raise it
+                six.reraise(*sys.exc_info())
+
+        try:
+            self.delete()
+        except StripeBankAccount.DoesNotExist:
+            # The bank account has already been deleted (potentially during the API call)
+            pass
+
 
 @class_doc_inherit
 class Card(StripeCard):
