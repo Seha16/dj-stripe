@@ -890,7 +890,12 @@ Fields not implemented:
         stripe_customer = self.api_retrieve()
         stripe_bank_account = stripe_customer.sources.retrieve(bank_account_stripe_id)
 
-        return stripe_bank_account.verify(amounts=amounts)
+        new_stripe_bank_account = stripe_bank_account.verify(amounts=amounts)
+
+        if not new_stripe_bank_account.get('default_for_currency'):
+            new_stripe_bank_account['default_for_currency'] = False
+
+        return new_stripe_bank_account
 
     def add_card(self, source, set_default=True):
         """
